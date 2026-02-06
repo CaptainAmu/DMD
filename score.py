@@ -86,5 +86,5 @@ class ScoreModel(nn.Module):
         # base unconditional score term
         term1 = (t_safe - 1) / t_safe * v_empty - (1.0 / t_safe) * x_t
         # guided correction
-        term2 = g * ((t_safe - 1) / t_safe) * (v_c - v_empty)
+        term2 = self.guidance * ((t_safe - 1) / t_safe) * (v_c - v_empty)
         return term1 + term2

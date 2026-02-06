@@ -144,11 +144,14 @@ def train_generator_ikl(
     """
     Update G_θ for Mgen steps using approximate IKL gradient:
 
-    ∇_θ L_IKL ∝ E[ (a(s_φ - s) + (1-g)(s - s_∅)) · (1-t) · ∂G_θ/∂θ ]
-    with x_t = G_θ(z, c), t ~ U[0.01, 0.99], z ~ N(0,I), c ~ p(C).
+    ∇_θ L_IKL ∝ E[ (a(s_φ(x_t,t,c) - s(x_t,t,c)) + (1-g)(s(x_t,t,c) - s(x_t,t,∅)))
+                     · (1-t) · ∂G_θ/∂θ ]
+    where:
+        x_0 = G_θ(z, c),  ε ~ N(0,I),  x_t = (1-t)*x_0 + t*ε,  t ~ U[0.01, 0.99].
 
-    We minimize L = -(coeff.detach() * G_θ(z,c)).sum() so that ∂L/∂θ = -coeff·∂G_θ/∂θ,
-    i.e. we ascend in the desired direction.
+    Implementation: compute coeff = (a(s_φ - s) + (1-g)(s - s_∅)) · (1-t)  (detached),
+    then backprop through  L = -(coeff · x_0).sum() / B  where x_0 = G_θ(z, c),
+    so that ∂L/∂θ ∝ -coeff · ∂G_θ/∂θ as desired.
 
     Args:
         G_theta: OneStepGenerator (trainable).
@@ -173,19 +176,25 @@ def train_generator_ikl(
 
     for step in range(Mgen):
         z = torch.randn(batch_size, N, device=device)
+        eps = torch.randn(batch_size, N, device=device)
         c = torch.randint(0, C, (batch_size,), device=device, dtype=torch.long)
         t = torch.rand(batch_size, device=device) * 0.98 + 0.01  # U[0.01, 0.99]
+        t_col = t.unsqueeze(-1)  # (B, 1)
 
-        x_t = G_theta(z, c)
-
+        # x_0 = G_θ(z, c) — but first compute coeff with x_t detached
         with torch.no_grad():
+            x_0_detached = G_theta(z, c)
+            x_t = (1 - t_col) * x_0_detached + t_col * eps  # (B, N)
             s_phi = score_model_phi(x_t, t, c)
             s = score_model_teacher(x_t, t, c)
             c_empty = torch.full((batch_size,), empty_label, dtype=torch.long, device=device)
             s_empty = score_model_teacher(x_t, t, c_empty)
-        # coeff shape (B, N)
-        coeff = (a * (s_phi - s) + (1 - g) * (s - s_empty)) * (1 - t).unsqueeze(-1)
-        loss = -(coeff.detach() * G_theta(z, c)).sum()
+        # coeff shape (B, N), detached
+        coeff = (a * (s_phi - s) + (1 - g) * (s - s_empty)) * (1 - t_col)
+
+        # Now compute x_0 with grad, and form the surrogate loss
+        x_0 = G_theta(z, c)  # (B, N), with grad
+        loss = -(coeff.detach() * x_0).sum() / batch_size
         opt.zero_grad()
         loss.backward()
         opt.step()
