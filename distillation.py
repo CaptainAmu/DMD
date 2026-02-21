@@ -135,6 +135,39 @@ def train_velocity_from_generator(
     return losses
 
 
+def _ode_backward_from_z(clean_teacher, z, c, steps=50):
+    """
+    Multi-step ODE backward from noise z (t=1) to data (t≈0) using the
+    clean-prediction teacher.  Euler method with dt = 1/steps.
+
+    At each step the effective velocity is v = (x_t - x*(x_t,t,c)) / t,
+    which is then integrated: x_{t-dt} = x_t - v * dt.
+
+    Args:
+        clean_teacher: CleanPredModel (or compatible) that maps (x_t, t, c) -> x*.
+        z: (B, N) starting noise at t=1.
+        c: (B,) class labels.
+        steps: number of Euler steps.
+
+    Returns:
+        x: (B, N) approximate clean sample at t≈0.
+    """
+    B = z.shape[0]
+    device = z.device
+    dt = 1.0 / steps
+    x = z.clone()
+    t = torch.ones(B, device=device)
+
+    for _ in range(steps):
+        t_col = t.unsqueeze(-1).clamp(min=1e-5)
+        x0 = clean_teacher(x, t, c)
+        v_eff = (x - x0) / t_col
+        x = x - v_eff * dt
+        t = t - dt
+
+    return x
+
+
 def distill_via_score_DMD(
     G_theta,
     score_model_phi,
@@ -146,9 +179,10 @@ def distill_via_score_DMD(
     a=1.0,
     g=1.0,
     lr=1e-4,
-    clean_model = None,
+    clean_model=None,
     reweight=False,
     reg_weight=0.0,
+    reg_ode_steps=1,
     device=None,
     verbose=True,
 ):
@@ -158,9 +192,13 @@ def distill_via_score_DMD(
 
     ∇_θ L_IKL = E[ (a(s_φ(x_t,t,c) - s(x_t,t,c)) + (1-g)(s(x_t,t,c) - s(x_t,t,∅)))
                      · (1-t) · ∂G_θ/∂θ ]
-    L_reg     = E_{z,c} || G_θ(z,c) - clean_model(z, 1, c) ||^2
+    L_reg     = E_{z,c} || G_θ(z,c) - y ||^2
 
-    where:
+    where y is obtained by running the teacher ODE backward from z for
+    reg_ode_steps steps.  When reg_ode_steps=1 this reduces to the
+    single-step clean prediction y = clean_model(z, 1, c).
+
+    Other symbols:
         x_0 = G_θ(z, c),  ε ~ N(0,I),  x_t = (1-t)*x_0 + t*ε,  t ~ U[0.01, 0.99].
 
     The IKL part is NOT a loss — it is the gradient itself.  We compute
@@ -181,6 +219,9 @@ def distill_via_score_DMD(
         clean_model: CleanPredModel (required if reweight=True or reg_weight>0).
         reweight: whether to reweight the IKL loss L_IKL by t^2 / ((1-t)|clean_pred - x0|).
         reg_weight: weight λ for the regression loss L_reg. 0 = disabled.
+        reg_ode_steps: number of Euler steps for the regression target.
+            1 = single-step clean prediction (original behavior).
+            >1 = multi-step ODE backward (more accurate).
 
     Returns:
         List of gradient-norm values (for logging).
@@ -231,8 +272,11 @@ def distill_via_score_DMD(
         if need_reg:
             assert clean_model is not None, "clean_model is required for reg_weight > 0!"
             with torch.no_grad():
-                t_one = torch.ones(batch_size, 1, device=device)
-                y = clean_model(z, t_one, c)           # teacher one-step prediction from noise
+                if reg_ode_steps <= 1:
+                    t_one = torch.ones(batch_size, 1, device=device)
+                    y = clean_model(z, t_one, c)
+                else:
+                    y = _ode_backward_from_z(clean_model, z, c, steps=reg_ode_steps)
             L_reg = ((x_0 - y) ** 2).mean()
             (reg_weight * L_reg).backward()
 
@@ -456,6 +500,7 @@ def distill_via_clean_DMD(
     lr=1e-4,
     reweight=False,
     reg_weight=0.0,
+    reg_ode_steps=1,
     device=None,
     verbose=True,
 ):
@@ -476,7 +521,10 @@ def distill_via_clean_DMD(
     With reweight (DMD paper Eqn 8):
         w'_t = (1-t) / (||x_teacher(x_t,t,c) - x_0||_1 + ε_stable).
 
-    L_reg = E_{z,c} || G_θ(z,c) - clean_teacher(z, 1, c) ||^2.
+    L_reg = E_{z,c} || G_θ(z,c) - y ||^2, where y is obtained by running
+    the teacher ODE backward from z for reg_ode_steps steps.  When
+    reg_ode_steps=1 this reduces to the single-step clean prediction
+    y = clean_teacher(z, 1, c).
 
     Args:
         G_theta: OneStepGenerator (trainable).
@@ -489,6 +537,9 @@ def distill_via_clean_DMD(
         lr, device, verbose: training options.
         reweight: whether to use simplified DMD reweight.
         reg_weight: weight λ for regression loss. 0 = disabled.
+        reg_ode_steps: number of Euler steps for the regression target.
+            1 = single-step clean prediction (original behavior).
+            >1 = multi-step ODE backward (more accurate).
 
     Returns:
         List of gradient-norm values (for logging).
@@ -539,8 +590,11 @@ def distill_via_clean_DMD(
 
         if need_reg:
             with torch.no_grad():
-                t_one = torch.ones(batch_size, 1, device=device)
-                y = clean_teacher(z, t_one, c)
+                if reg_ode_steps <= 1:
+                    t_one = torch.ones(batch_size, 1, device=device)
+                    y = clean_teacher(z, t_one, c)
+                else:
+                    y = _ode_backward_from_z(clean_teacher, z, c, steps=reg_ode_steps)
             L_reg = ((x_0 - y) ** 2).mean()
             (reg_weight * L_reg).backward()
 
